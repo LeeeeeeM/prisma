@@ -3,7 +3,7 @@
 import Debug from '@prisma/debug'
 import { enginesVersion } from '@prisma/engines'
 import { download } from '@prisma/fetch-engine'
-import { arg, handlePanic, HelpError, isCurrentBinInstalledGlobally, isError, isRustPanic } from '@prisma/internals'
+import { arg, handlePanic, HelpError, isRustPanic } from '@prisma/internals'
 import {
   DbCommand,
   DbExecute,
@@ -40,11 +40,10 @@ import { Platform } from './platform/_Platform'
 import { Studio } from './Studio'
 import { SubCommand } from './SubCommand'
 import { Telemetry } from './Telemetry'
-import { redactCommandArray, runCheckpointClientCheck } from './utils/checkpoint'
+import { redactCommandArray } from './utils/checkpoint'
 import { loadOrInitializeCommandState } from './utils/commandState'
 import { detectPrisma1 } from './utils/detectPrisma1'
 import { loadConfig } from './utils/loadConfig'
-import { printUpdateMessage } from './utils/printUpdateMessage'
 import { Validate } from './Validate'
 import { Version } from './Version'
 
@@ -70,18 +69,11 @@ process.once('SIGINT', () => {
 const args = arg(
   commandArray,
   {
-    '--schema': String,
     '--config': String,
-    '--telemetry-information': String,
   },
   false,
   true,
 )
-
-// Redact the command options and make it a string
-const redactedCommandAsString = redactCommandArray([...commandArray]).join(' ')
-
-const isPrismaInstalledGlobally = isCurrentBinInstalledGlobally()
 
 /**
  * Main function
@@ -189,38 +181,13 @@ async function main(): Promise<number> {
   const cliExecElapsedTime = endCliExec - startCliExec
   debug(`Execution time for executing "await cli.parse(commandArray)": ${cliExecElapsedTime} ms`)
 
-  // Did it error?
-  if (result instanceof HelpError) {
-    console.error(result.message)
-    // TODO: We could do like Bash (and other)
-    // = return an exit status of 2 to indicate incorrect usage like invalid options or missing arguments.
-    // https://tldp.org/LDP/abs/html/exitcodes.html
-    return 1
-  } else if (isError(result)) {
-    console.error(result)
+  if (result instanceof Error) {
+    console.error(result instanceof HelpError ? result.message : result)
     return 1
   }
 
   // Success
   console.log(result)
-
-  /**
-   * Prepare data and run the Checkpoint Client
-   * See function for more info
-   */
-  const checkResult = await runCheckpointClientCheck({
-    command: redactedCommandAsString,
-    isPrismaInstalledGlobally,
-    schemaPath: args['--schema'],
-    schemaPathFromConfig: config.schema,
-    telemetryInformation: args['--telemetry-information'],
-    version: packageJson.version,
-  })
-  // if the result is cached and CLI outdated, show the `Update available` message
-  const shouldHide = process.env.PRISMA_HIDE_UPDATE_MESSAGE
-  if (checkResult && checkResult.status === 'ok' && checkResult.data.outdated && !shouldHide) {
-    printUpdateMessage(checkResult)
-  }
 
   return 0
 }
@@ -253,7 +220,7 @@ function handleIndividualError(error: Error): void {
       error,
       cliVersion: packageJson.version,
       enginesVersion,
-      command: redactedCommandAsString,
+      command: redactCommandArray([...commandArray]).join(' '),
       getDatabaseVersionSafe,
     })
       .catch((e) => {
