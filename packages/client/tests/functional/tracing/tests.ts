@@ -112,7 +112,7 @@ testMatrix.setupTestSuite(
     const isSqlServer = provider === Providers.SQLSERVER
 
     const usesSyntheticTxQueries =
-      driverAdapter !== undefined && ['js_d1', 'js_libsql', 'js_planetscale'].includes(driverAdapter)
+      driverAdapter !== undefined && ['js_d1', 'js_libsql', 'js_planetscale', 'js_mssql'].includes(driverAdapter)
 
     beforeEach(async () => {
       await prisma.$connect()
@@ -290,6 +290,9 @@ testMatrix.setupTestSuite(
         if (provider === Providers.SQLSERVER) {
           return dbSystem === 'mssql'
         }
+        if (driverAdapter === 'js_pg_cockroachdb') {
+          return dbSystem === 'postgresql'
+        }
 
         return dbSystem === provider
       })
@@ -362,7 +365,7 @@ testMatrix.setupTestSuite(
 
       const dbQueries: Tree[] = []
       if (tx) {
-        if (isSqlServer) {
+        if (isSqlServer && driverAdapter === undefined) {
           dbQueries.push(txSetIsolationLevel())
         }
         if (driverAdapter === undefined) {
@@ -388,7 +391,7 @@ testMatrix.setupTestSuite(
       if (operation === 'start') {
         children = isMongoDb
           ? engineConnection()
-          : isSqlServer
+          : isSqlServer && driverAdapter === undefined
           ? [...engineConnection(), txSetIsolationLevel(), txBegin()]
           : driverAdapter === undefined
           ? [...engineConnection(), txBegin()]
@@ -475,7 +478,7 @@ testMatrix.setupTestSuite(
             // Driver adapters do not issue BEGIN through the query engine.
             expectedDbQueries.unshift(txBegin())
           }
-          if (isSqlServer) {
+          if (isSqlServer && driverAdapter === undefined) {
             expectedDbQueries.unshift(txSetIsolationLevel())
           }
         }
@@ -509,7 +512,7 @@ testMatrix.setupTestSuite(
             // Driver adapters do not issue BEGIN through the query engine.
             expectedDbQueries.unshift(txBegin())
           }
-          if (isSqlServer) {
+          if (isSqlServer && driverAdapter === undefined) {
             expectedDbQueries.unshift(txSetIsolationLevel())
           }
         } else {
@@ -552,7 +555,7 @@ testMatrix.setupTestSuite(
             // Driver adapters do not issue BEGIN through the query engine.
             expectedDbQueries.unshift(txBegin())
           }
-          if (isSqlServer) {
+          if (isSqlServer && driverAdapter === undefined) {
             expectedDbQueries.unshift(txSetIsolationLevel())
           }
         } else {
@@ -640,7 +643,7 @@ testMatrix.setupTestSuite(
             // Driver adapters do not issue BEGIN through the query engine.
             expectedDbQueries.unshift(txBegin())
           }
-          if (isSqlServer) {
+          if (isSqlServer && driverAdapter === undefined) {
             expectedDbQueries.unshift(txSetIsolationLevel())
           }
         }

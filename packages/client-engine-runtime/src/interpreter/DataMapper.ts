@@ -77,13 +77,13 @@ function mapObject(
       }
 
       case 'Object': {
-        if (!node.flattened && !Object.hasOwn(data, name)) {
+        if (node.serializedName !== null && !Object.hasOwn(data, node.serializedName)) {
           throw new DataMapperError(
             `Missing data field (Object): '${name}'; ` + `node: ${JSON.stringify(node)}; data: ${JSON.stringify(data)}`,
           )
         }
 
-        const target = node.flattened ? data : data[name]
+        const target = node.serializedName !== null ? data[node.serializedName] : data
         result[name] = mapArrayOrObject(target, node.fields, enums)
         break
       }
@@ -185,6 +185,12 @@ function mapValue(
           throw new DataMapperError(`Expected a boolean in column '${columnName}', got ${typeof value}: ${value}`)
         }
       }
+      if (value instanceof Uint8Array) {
+        for (const byte of value) {
+          if (byte !== 0) return true
+        }
+        return false
+      }
       throw new DataMapperError(`Expected a boolean in column '${columnName}', got ${typeof value}: ${value}`)
     }
 
@@ -230,6 +236,9 @@ function mapValue(
         return { $type: 'Bytes', value: Buffer.from(value.slice(2), 'hex').toString('base64') }
       }
       if (Array.isArray(value)) {
+        return { $type: 'Bytes', value: Buffer.from(value).toString('base64') }
+      }
+      if (value instanceof Uint8Array) {
         return { $type: 'Bytes', value: Buffer.from(value).toString('base64') }
       }
       throw new DataMapperError(`Expected a byte array in column '${columnName}', got ${typeof value}: ${value}`)

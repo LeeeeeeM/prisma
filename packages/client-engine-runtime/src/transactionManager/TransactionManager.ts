@@ -90,23 +90,21 @@ export class TransactionManager {
     this.transactions.set(transaction.id, transaction)
 
     // Start timeout to wait for transaction to be started.
-    transaction.timer = this.startTransactionTimeout(transaction.id, validatedOptions.maxWait!)
+    const startTimer = setTimeout(() => (transaction.status = 'timed_out'), validatedOptions.maxWait!)
 
-    const startedTransaction = await this.driverAdapter.startTransaction(validatedOptions.isolationLevel)
+    transaction.transaction = await this.driverAdapter.startTransaction(validatedOptions.isolationLevel)
+
+    clearTimeout(startTimer)
 
     // Transaction status might have changed to timed_out while waiting for transaction to start. => Check for it!
     switch (transaction.status) {
       case 'waiting':
-        transaction.transaction = startedTransaction
-        clearTimeout(transaction.timer)
-        transaction.timer = undefined
         transaction.status = 'running'
-
         // Start timeout to wait for transaction to be finished.
         transaction.timer = this.startTransactionTimeout(transaction.id, validatedOptions.timeout!)
-
         return { id: transaction.id }
       case 'timed_out':
+        await this.closeTransaction(transaction, 'timed_out')
         throw new TransactionStartTimeoutError()
       case 'running':
       case 'committed':
@@ -201,32 +199,34 @@ export class TransactionManager {
 
     tx.status = status
 
-    if (tx.transaction && status === 'committed') {
-      if (tx.transaction.options.usePhantomQuery) {
-        await this.#withQuerySpanAndEvent(PHANTOM_COMMIT_QUERY(), tx.transaction, () => tx.transaction!.commit())
-      } else {
-        await tx.transaction.commit()
-        const query = COMMIT_QUERY()
-        await this.#withQuerySpanAndEvent(query, tx.transaction, () => tx.transaction!.executeRaw(query))
+    try {
+      if (tx.transaction && status === 'committed') {
+        if (tx.transaction.options.usePhantomQuery) {
+          await this.#withQuerySpanAndEvent(PHANTOM_COMMIT_QUERY(), tx.transaction, () => tx.transaction!.commit())
+        } else {
+          const query = COMMIT_QUERY()
+          await this.#withQuerySpanAndEvent(query, tx.transaction, () => tx.transaction!.executeRaw(query))
+          await tx.transaction.commit()
+        }
+      } else if (tx.transaction) {
+        if (tx.transaction.options.usePhantomQuery) {
+          await this.#withQuerySpanAndEvent(PHANTOM_ROLLBACK_QUERY(), tx.transaction, () => tx.transaction!.rollback())
+        } else {
+          const query = ROLLBACK_QUERY()
+          await this.#withQuerySpanAndEvent(query, tx.transaction, () => tx.transaction!.executeRaw(query))
+          await tx.transaction.rollback()
+        }
       }
-    } else if (tx.transaction) {
-      if (tx.transaction.options.usePhantomQuery) {
-        await this.#withQuerySpanAndEvent(PHANTOM_ROLLBACK_QUERY(), tx.transaction, () => tx.transaction!.rollback())
-      } else {
-        await tx.transaction.rollback()
-        const query = ROLLBACK_QUERY()
-        await this.#withQuerySpanAndEvent(query, tx.transaction, () => tx.transaction!.executeRaw(query))
+    } finally {
+      clearTimeout(tx.timer)
+      tx.timer = undefined
+
+      this.transactions.delete(tx.id)
+
+      this.closedTransactions.push(tx)
+      if (this.closedTransactions.length > MAX_CLOSED_TRANSACTIONS) {
+        this.closedTransactions.shift()
       }
-    }
-
-    clearTimeout(tx.timer)
-    tx.timer = undefined
-
-    this.transactions.delete(tx.id)
-
-    this.closedTransactions.push(tx)
-    if (this.closedTransactions.length > MAX_CLOSED_TRANSACTIONS) {
-      this.closedTransactions.shift()
     }
   }
 
