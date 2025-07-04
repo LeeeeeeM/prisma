@@ -5,8 +5,11 @@ import type { BinaryPaths, DownloadOptions } from '@prisma/fetch-engine'
 import type { Command, Commands } from '@prisma/internals'
 import { arg, drawBox, format, HelpError, isError, link, logger, unknownCommand } from '@prisma/internals'
 import { bold, dim, green, red, underline } from 'kleur/colors'
+import { match } from 'ts-pattern'
 
+import { runCheckpointClientCheck } from './utils/checkpoint'
 import { getClientGeneratorInfo } from './utils/client'
+import { printUpdateMessage } from './utils/printUpdateMessage'
 import { Version } from './Version'
 
 const debug = Debug('prisma:cli')
@@ -72,13 +75,16 @@ export class CLI implements Command {
     const { engineType } = await getClientGeneratorInfo({
       schemaPathFromConfig: config.schema,
       schemaPathFromArg,
-    }).catch((error) => {
-      const e = error as Error
+    }).catch((e) => {
       debug('Failed to read schema information. Using default values: %o', e)
-      return {
-        previewFeatures: [],
-        engineType: 'library' as const,
-      }
+
+      const id = <const T>(x: T): T => x
+      const engineType = match(process.env.PRISMA_CLI_QUERY_ENGINE_TYPE ?? process.env.PRISMA_QUERY_ENGINE_TYPE)
+        .with('binary', id)
+        .with('library', id)
+        .otherwise(() => 'library' as const)
+
+      return { engineType }
     })
 
     if (args['--version']) {
@@ -109,6 +115,11 @@ export class CLI implements Command {
 
     const cmd = this.cmds[cmdName]
     if (cmd) {
+      // Only track if the command actually exists
+      const checkResultPromise = runCheckpointClientCheck({ schemaPathFromConfig: config.schema }).catch(() => {
+        /* noop */
+      })
+
       // if we have that subcommand, let's ensure that the binary is there in case the command needs it
       if (this.ensureBinaries.includes(cmdName)) {
         await ensureNeededBinariesExist({
@@ -129,7 +140,11 @@ export class CLI implements Command {
         argsForCmd = args._.slice(1)
       }
 
-      return cmd.parse(argsForCmd, config)
+      const result = await cmd.parse(argsForCmd, config)
+
+      printUpdateMessage(await checkResultPromise)
+
+      return result
     }
     // unknown command
     return unknownCommand(this.help() as string, args._[0])

@@ -1,7 +1,8 @@
 import { SqlQuery, SqlQueryable, SqlResultSet } from '@prisma/driver-adapter-utils'
 
 import { QueryEvent } from '../events'
-import { JoinExpression, Pagination, QueryPlanNode } from '../QueryPlan'
+import { FieldInitializer, FieldOperation, JoinExpression, Pagination, QueryPlanNode } from '../QueryPlan'
+import { type SchemaProvider } from '../schema'
 import { type TracingHelper, withQuerySpanAndEvent } from '../tracing'
 import { type TransactionManager } from '../transactionManager/TransactionManager'
 import { rethrowAsUserFacing } from '../UserFacingError'
@@ -22,6 +23,7 @@ export type QueryInterpreterOptions = {
   tracingHelper: TracingHelper
   serializer: (results: SqlResultSet) => Value
   rawSerializer?: (results: SqlResultSet) => Value
+  provider?: SchemaProvider
 }
 
 export class QueryInterpreter {
@@ -32,6 +34,7 @@ export class QueryInterpreter {
   readonly #tracingHelper: TracingHelper
   readonly #serializer: (results: SqlResultSet) => Value
   readonly #rawSerializer: (results: SqlResultSet) => Value
+  readonly #provider?: SchemaProvider
 
   constructor({
     transactionManager,
@@ -40,6 +43,7 @@ export class QueryInterpreter {
     tracingHelper,
     serializer,
     rawSerializer,
+    provider,
   }: QueryInterpreterOptions) {
     this.#transactionManager = transactionManager
     this.#placeholderValues = placeholderValues
@@ -47,6 +51,7 @@ export class QueryInterpreter {
     this.#tracingHelper = tracingHelper
     this.#serializer = serializer
     this.#rawSerializer = rawSerializer ?? serializer
+    this.#provider = provider
   }
 
   static forSql(options: {
@@ -54,6 +59,7 @@ export class QueryInterpreter {
     placeholderValues: Record<string, unknown>
     onQuery?: (event: QueryEvent) => void
     tracingHelper: TracingHelper
+    provider?: SchemaProvider
   }): QueryInterpreter {
     return new QueryInterpreter({
       transactionManager: options.transactionManager,
@@ -62,6 +68,7 @@ export class QueryInterpreter {
       tracingHelper: options.tracingHelper,
       serializer: serializeSql,
       rawSerializer: serializeRawSql,
+      provider: options.provider,
     })
   }
 
@@ -83,6 +90,10 @@ export class QueryInterpreter {
     generators: GeneratorRegistrySnapshot,
   ): Promise<IntermediateValue> {
     switch (node.type) {
+      case 'value': {
+        return { value: evaluateParam(node.args, scope, generators) }
+      }
+
       case 'seq': {
         let result: IntermediateValue | undefined
         for (const arg of node.args) {
@@ -194,14 +205,7 @@ export class QueryInterpreter {
           })),
         )) satisfies JoinExpressionWithRecords[]
 
-        if (Array.isArray(parent)) {
-          for (const record of parent) {
-            attachChildrenToParent(asRecord(record), children)
-          }
-          return { value: parent, lastInsertId }
-        }
-
-        return { value: attachChildrenToParent(asRecord(parent), children), lastInsertId }
+        return { value: attachChildrenToParents(parent, children), lastInsertId }
       }
 
       case 'transaction': {
@@ -295,18 +299,23 @@ export class QueryInterpreter {
         return { value: paginate(list as {}[], node.args.pagination), lastInsertId }
       }
 
-      case 'extendRecord': {
-        const { value, lastInsertId } = await this.interpretNode(node.args.expr, queryable, scope, generators)
-        const record = value === null ? {} : asRecord(value)
+      case 'initializeRecord': {
+        const { lastInsertId } = await this.interpretNode(node.args.expr, queryable, scope, generators)
 
-        for (const [key, entry] of Object.entries(node.args.values)) {
-          if (entry.type === 'lastInsertId') {
-            record[key] = lastInsertId
-          } else {
-            record[key] = evaluateParam(entry.value, scope, generators)
-          }
+        const record = {}
+        for (const [key, initializer] of Object.entries(node.args.fields)) {
+          record[key] = evalFieldInitializer(initializer, lastInsertId, scope, generators)
         }
+        return { value: record, lastInsertId }
+      }
 
+      case 'mapRecord': {
+        const { value, lastInsertId } = await this.interpretNode(node.args.expr, queryable, scope, generators)
+
+        const record = value === null ? {} : asRecord(value)
+        for (const [key, entry] of Object.entries(node.args.fields)) {
+          record[key] = evalFieldOperation(entry, record[key], scope, generators)
+        }
         return { value: record, lastInsertId }
       }
 
@@ -318,8 +327,8 @@ export class QueryInterpreter {
   #withQuerySpanAndEvent<T>(query: SqlQuery, queryable: SqlQueryable, execute: () => Promise<T>): Promise<T> {
     return withQuerySpanAndEvent({
       query,
-      queryable,
       execute,
+      provider: this.#provider ?? queryable.provider,
       tracingHelper: this.#tracingHelper,
       onQuery: this.#onQuery,
     })
@@ -375,41 +384,44 @@ type JoinExpressionWithRecords = {
   childRecords: Value
 }
 
-function attachChildrenToParent(parentRecord: PrismaObject, children: JoinExpressionWithRecords[]) {
+function attachChildrenToParents(parentRecords: unknown, children: JoinExpressionWithRecords[]) {
   for (const { joinExpr, childRecords } of children) {
-    parentRecord[joinExpr.parentField] = filterChildRecords(childRecords, parentRecord, joinExpr)
-  }
-  return parentRecord
-}
+    const parentKeys = joinExpr.on.map(([k]) => k)
+    const childKeys = joinExpr.on.map(([, k]) => k)
+    const parentMap = {}
 
-function filterChildRecords(records: Value, parentRecord: PrismaObject, joinExpr: JoinExpression) {
-  if (Array.isArray(records)) {
-    const filtered = records.filter((record) => childRecordMatchesParent(asRecord(record), parentRecord, joinExpr))
-    if (joinExpr.isRelationUnique) {
-      return filtered.length > 0 ? filtered[0] : null
-    } else {
-      return filtered
-    }
-  } else if (records === null) {
-    // we can get here in case of a join with a missing UNIQUE node
-    return null
-  } else {
-    const record = asRecord(records)
-    return childRecordMatchesParent(record, parentRecord, joinExpr) ? record : null
-  }
-}
+    for (const parent of Array.isArray(parentRecords) ? parentRecords : [parentRecords]) {
+      const parentRecord = asRecord(parent)
+      const key = getRecordKey(parentRecord, parentKeys)
+      if (!parentMap[key]) {
+        parentMap[key] = []
+      }
+      parentMap[key].push(parentRecord)
 
-function childRecordMatchesParent(
-  childRecord: PrismaObject,
-  parentRecord: PrismaObject,
-  joinExpr: JoinExpression,
-): boolean {
-  for (const [parentField, childField] of joinExpr.on) {
-    if (parentRecord[parentField] !== childRecord[childField]) {
-      return false
+      if (joinExpr.isRelationUnique) {
+        parentRecord[joinExpr.parentField] = null
+      } else {
+        parentRecord[joinExpr.parentField] = []
+      }
+    }
+
+    for (const childRecord of Array.isArray(childRecords) ? childRecords : [childRecords]) {
+      if (childRecord === null) {
+        continue
+      }
+
+      const key = getRecordKey(asRecord(childRecord), childKeys)
+      for (const parentRecord of parentMap[key] ?? []) {
+        if (joinExpr.isRelationUnique) {
+          parentRecord[joinExpr.parentField] = childRecord
+        } else {
+          parentRecord[joinExpr.parentField].push(childRecord)
+        }
+      }
     }
   }
-  return true
+
+  return parentRecords
 }
 
 function paginate(list: {}[], { cursor, skip, take }: Pagination): {}[] {
@@ -428,4 +440,52 @@ function paginate(list: {}[], { cursor, skip, take }: Pagination): {}[] {
  */
 function getRecordKey(record: {}, fields: string[]): string {
   return JSON.stringify(fields.map((field) => record[field]))
+}
+
+function evalFieldInitializer(
+  initializer: FieldInitializer,
+  lastInsertId: string | undefined,
+  scope: ScopeBindings,
+  generators: GeneratorRegistrySnapshot,
+): Value {
+  switch (initializer.type) {
+    case 'value':
+      return evaluateParam(initializer.value, scope, generators)
+    case 'lastInsertId':
+      return lastInsertId
+    default:
+      assertNever(initializer, `Unexpected field initializer type: ${initializer['type']}`)
+  }
+}
+
+function evalFieldOperation(
+  op: FieldOperation,
+  value: Value,
+  scope: ScopeBindings,
+  generators: GeneratorRegistrySnapshot,
+): Value {
+  switch (op.type) {
+    case 'set':
+      return evaluateParam(op.value, scope, generators)
+    case 'add':
+      return asNumber(value) + asNumber(evaluateParam(op.value, scope, generators))
+    case 'subtract':
+      return asNumber(value) - asNumber(evaluateParam(op.value, scope, generators))
+    case 'multiply':
+      return asNumber(value) * asNumber(evaluateParam(op.value, scope, generators))
+    case 'divide': {
+      const lhs = asNumber(value)
+      const rhs = asNumber(evaluateParam(op.value, scope, generators))
+      // SQLite and older versions of MySQL return NULL for division by zero, so we emulate
+      // that behavior here.
+      // If the database does not permit division by zero, a database error should be raised,
+      // preventing this case from being executed.
+      if (rhs === 0) {
+        return null
+      }
+      return lhs / rhs
+    }
+    default:
+      assertNever(op, `Unexpected field operation type: ${op['type']}`)
+  }
 }
